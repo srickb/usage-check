@@ -1,0 +1,421 @@
+import * as claude from "./claude.js";
+import * as codex from "./codex.js";
+import { ICON_SVG, renderPage } from "./page.js";
+import { widgetScript } from "./widget.js";
+import { tokenStore } from "./tokens.js";
+import { AuthExpiredError, getJson, putJson, randomToken } from "./util.js";
+
+// 토큰 저장소 Durable Object (wrangler.toml의 TOKENS 바인딩)
+export { TokenStore } from "./tokens.js";
+
+const PROVIDERS = { claude, codex };
+const SESSION_COOKIE = "uc_session";
+const SESSION_TTL = 60 * 60 * 24 * 30;
+
+// 화면 HTML과 manifest는 요청마다 바뀌지 않아서 한 번만 만들어 둬요. (무료 플랜 CPU 시간 절약)
+const PAGES = {
+  setup: renderPage({ setupMissing: true }),
+  login: renderPage({ authed: false }),
+  dashboard: renderPage({ authed: true }),
+};
+const MANIFEST = JSON.stringify({
+  name: "AI 사용량",
+  short_name: "사용량",
+  start_url: "/",
+  display: "standalone",
+  background_color: "#0C0D10",
+  theme_color: "#0C0D10",
+  icons: [
+    {
+      src: "data:image/svg+xml," + encodeURIComponent(ICON_SVG),
+      sizes: "any",
+      type: "image/svg+xml",
+    },
+  ],
+});
+
+export default {
+  async fetch(request, env, ctx) {
+    try {
+      return await handle(request, env, ctx);
+    } catch (err) {
+      return json({ error: err.message || String(err) }, 500);
+    }
+  },
+
+  async scheduled(_event, env, ctx) {
+    ctx.waitUntil(refreshAll(env));
+  },
+};
+
+async function handle(request, env, ctx) {
+  const url = new URL(request.url);
+  const { pathname } = url;
+
+  if (!env.DASHBOARD_PASSWORD) {
+    return html(PAGES.setup);
+  }
+
+  if (pathname === "/api/login" && request.method === "POST") {
+    return login(request, env);
+  }
+
+  // 로그인 쿠키가 필요 없는 경로는 세션 확인(KV 읽기) 전에 처리해요.
+  if (pathname === "/manifest.webmanifest") return manifest();
+  if (pathname.startsWith("/relay/")) return relay(request, env, pathname);
+  if (pathname === "/api/widget" && request.method === "GET") return widgetData(env, url);
+
+  const authed = await isAuthed(request, env);
+
+  if (pathname === "/" || pathname === "/index.html") {
+    return html(authed ? PAGES.dashboard : PAGES.login);
+  }
+
+  // 로그인 페이지로 바로 보내는 링크. 비동기 처리 없이 열 수 있어서 휴대폰 팝업 차단에 걸리지 않아요.
+  // 홈 화면 앱에서 연 링크는 Safari로 넘어가 쿠키가 없을 수 있어서, 1회용 토큰(t)도 받아요.
+  if (pathname === "/claude/login" && request.method === "GET") {
+    const t = url.searchParams.get("t");
+    const viaToken = !!t && !!(await env.KV.get(`claudelogin:${t}`));
+    if (!authed && !viaToken) return Response.redirect(new URL("/", url), 302);
+    if (viaToken) await env.KV.delete(`claudelogin:${t}`);
+    const { url: target } = await claude.startLogin(env);
+    return new Response(null, { status: 302, headers: { Location: target, "Cache-Control": "no-store" } });
+  }
+
+  if (!authed) return json({ error: "unauthorized" }, 401);
+  if (request.method === "POST" && request.headers.get("Content-Type")?.includes("application/json") !== true) {
+    return json({ error: "JSON 요청만 허용돼요." }, 415);
+  }
+
+  if (pathname === "/api/logout" && request.method === "POST") return logout(request, env);
+
+  if (pathname === "/api/usage" && request.method === "GET") {
+    let dispatch;
+    if (url.searchParams.get("refresh") === "1") {
+      [, dispatch] = await Promise.all([refreshAll(env), dispatchCodex(env)]);
+    }
+    const out = await readAll(env);
+    if (dispatch) out.codex.dispatch = dispatch;
+    return json(out);
+  }
+
+  if (pathname === "/api/claude/diag" && request.method === "GET") {
+    const [results, history] = await Promise.all([claude.diagnose(), tokenStore(env).history()]);
+    // history: 토큰 갱신·거부 기록 (토큰 값은 들어 있지 않아요)
+    return json({ checked_at: new Date().toISOString(), results, history });
+  }
+
+  if (pathname === "/api/widget/key" && request.method === "POST") {
+    const body = await request.json().catch(() => ({}));
+    return json({ key: await widgetKey(env, !!body.rotate) });
+  }
+  if (pathname === "/widget.js" && request.method === "GET") {
+    const key = await widgetKey(env, false);
+    return new Response(widgetScript(url.origin, key), {
+      headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" },
+    });
+  }
+
+  const m = pathname.match(/^\/api\/(claude|codex)\/(start|finish|poll|disconnect)$/);
+  if (m && request.method === "POST") {
+    const [, name, action] = m;
+    const p = PROVIDERS[name];
+    const body = await request.json().catch(() => ({}));
+    if (action === "start") return json(await p.startLogin(env));
+    if (action === "finish" && name === "claude") {
+      await p.finishLogin(env, body.code);
+      ctx.waitUntil(refreshOne(env, name));
+      return json({ ok: true });
+    }
+    if (action === "poll" && name === "codex") {
+      const r = await p.pollLogin(env);
+      if (!r.pending) {
+        await env.KV.delete(`usage:${name}`);
+        ctx.waitUntil(refreshOne(env, name));
+      }
+      return json(r);
+    }
+    if (action === "disconnect") {
+      await p.disconnect(env);
+      await env.KV.delete(`usage:${name}`);
+      return json({ ok: true });
+    }
+  }
+
+  return json({ error: "not found" }, 404);
+}
+
+// chatgpt.com이 Cloudflare Worker에서 오는 요청을 막아서, RELAY_SECRET이 있으면
+// Codex 조회는 GitHub Actions(scripts/codex-relay.mjs)가 대신 해요.
+function usesRelay(env, name) {
+  return name === "codex" && !!env.RELAY_SECRET;
+}
+
+async function refreshOne(env, name) {
+  if (usesRelay(env, name)) return;
+  const p = PROVIDERS[name];
+  let entry;
+  try {
+    const usage = await p.fetchUsage(env);
+    if (!usage) {
+      await env.KV.delete(`usage:${name}`);
+      return;
+    }
+    entry = { ok: true, fetched_at: now(), ...usage };
+  } catch (err) {
+    // 이전 값은 실패했을 때만 필요해서, 성공하면 읽지 않아요.
+    const prev = await getJson(env.KV, `usage:${name}`);
+    entry = {
+      ...(prev || {}),
+      ok: false,
+      error: err.message || String(err),
+      needs_reconnect: err instanceof AuthExpiredError,
+      error_at: now(),
+    };
+  }
+  await putJson(env.KV, `usage:${name}`, entry);
+}
+
+async function refreshAll(env) {
+  await Promise.all(Object.keys(PROVIDERS).map((n) => refreshOne(env, n)));
+}
+
+async function readAll(env, { skipLoginToken = false } = {}) {
+  // 두 서비스의 KV 읽기를 한꺼번에 하고, 결과는 항상 같은 순서(claude → codex)로 담아요.
+  const entries = await Promise.all(
+    Object.entries(PROVIDERS).map(async ([name, p]) => {
+      const relayMode = usesRelay(env, name);
+      let [connected, usage] = await Promise.all([p.isConnected(env), getJson(env.KV, `usage:${name}`)]);
+      // 중계 모드에선 Worker가 직접 조회하던 시절의 오래된 결과는 보여주지 않아요.
+      if (relayMode && usage && usage.via !== "relay") usage = null;
+      return [name, { connected, usage, relay: relayMode }];
+    })
+  );
+  const out = Object.fromEntries(entries);
+  if (!skipLoginToken && (!out.claude.connected || out.claude.usage?.needs_reconnect)) {
+    const t = randomToken(24);
+    await env.KV.put(`claudelogin:${t}`, "1", { expirationTtl: 1800 });
+    out.claude.login_url = `/claude/login?t=${t}`;
+  }
+  out.now = now();
+  return out;
+}
+
+// ---- 새로고침 시 Codex 중계 즉시 실행 ----
+
+// GITHUB_TOKEN(이 레포의 Actions 쓰기 권한만 있는 토큰)이 있으면 워크플로를 바로 실행해요.
+// 연타로 워크플로가 겹치지 않게 1분에 한 번까지만 실행해요.
+async function dispatchCodex(env) {
+  if (!usesRelay(env, "codex") || !(await codex.isConnected(env))) return null;
+  const token = (env.GITHUB_TOKEN || "").trim();
+  if (!token) return { started: false, reason: "no_token" };
+  const last = Number(await env.KV.get("dispatch:codex")) || 0;
+  if (now() - last < 60) return { started: false, reason: "recent", at: last };
+
+  // 레포 이름은 중계 워크플로가 처음 실행될 때 자동으로 저장돼요. 직접 정하고 싶으면 GITHUB_REPO 변수를 넣어요.
+  const repo = env.GITHUB_REPO || (await env.KV.get("github:repo"));
+  if (!repo) {
+    return {
+      started: false,
+      reason: "error",
+      error: "아직 레포 이름을 몰라요. GitHub → Actions → 'Codex 사용량 중계' → Run workflow를 한 번 실행해 주세요.",
+    };
+  }
+  const res = await fetch(`https://api.github.com/repos/${repo}/actions/workflows/codex-usage.yml/dispatches`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "usage-check",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ ref: "main" }),
+  });
+  if (res.status !== 204) {
+    const hint =
+      res.status === 401
+        ? "GITHUB_TOKEN이 틀렸거나 만료됐어요."
+        : res.status === 403 || res.status === 404
+          ? "GITHUB_TOKEN에 이 레포의 Actions 쓰기 권한이 없어요."
+          : (await res.text().catch(() => "")).slice(0, 200);
+    return { started: false, reason: "error", error: `Codex 즉시 조회 실패 (HTTP ${res.status}): ${hint}` };
+  }
+  await env.KV.put("dispatch:codex", String(now()), { expirationTtl: 300 });
+  return { started: true, at: now() };
+}
+
+// ---- iOS 위젯 (Scriptable) ----
+
+async function widgetKey(env, rotate) {
+  let key = rotate ? null : await env.KV.get("widget:key");
+  if (!key) {
+    key = randomToken(24);
+    await env.KV.put("widget:key", key);
+  }
+  return key;
+}
+
+async function widgetData(env, url) {
+  const key = await env.KV.get("widget:key");
+  const given = url.searchParams.get("key") || "";
+  if (!key || !(await safeEqual(given, key))) return json({ error: "unauthorized" }, 401);
+
+  // 위젯이 다시 그려질 때 오래된 값이면 새로 조회해요.
+  // KV 쓰기 한도(하루 1,000회)를 넘지 않게 Claude는 5분, Codex는 10분 지난 경우에만 해요.
+  // 위젯의 새로고침 버튼(force=1)은 이 간격을 무시해요. Codex 즉시 실행은 1분 제한이 따로 있어요.
+  let codexRefreshing = false;
+  let codexDispatch = null;
+  if (url.searchParams.get("refresh") === "1") {
+    const force = url.searchParams.get("force") === "1";
+    const [cu, xu] = await Promise.all([getJson(env.KV, "usage:claude"), getJson(env.KV, "usage:codex")]);
+    const age = (u) => now() - Math.max(u?.fetched_at || 0, u?.error_at || 0);
+    const jobs = [];
+    if (force || age(cu) >= 300) jobs.push(refreshOne(env, "claude"));
+    if (force || age(xu) >= 600) jobs.push(dispatchCodex(env).then((d) => { codexRefreshing = !!d?.started; codexDispatch = d; }));
+    await Promise.all(jobs);
+  }
+
+  const all = await readAll(env, { skipLoginToken: true });
+  const pick = (p) => ({
+    connected: p.connected,
+    ok: p.usage?.ok ?? null,
+    fetched_at: p.usage?.fetched_at ?? null,
+    error_at: p.usage?.error_at ?? null,
+    windows: (p.usage?.windows || []).map(({ label, used_percent, resets_at }) => ({ label, used_percent, resets_at })),
+  });
+  return json({ claude: pick(all.claude), codex: { ...pick(all.codex), refreshing: codexRefreshing, dispatch: codexDispatch }, now: all.now });
+}
+
+// ---- GitHub Actions 중계 (Codex) ----
+
+async function relay(request, env, pathname) {
+  if (!env.RELAY_SECRET) return json({ error: "RELAY_SECRET이 설정되지 않았어요." }, 404);
+  const auth = request.headers.get("Authorization") || "";
+  if (!(await safeEqual(auth.trim(), `Bearer ${env.RELAY_SECRET.trim()}`))) return json({ error: "unauthorized" }, 401);
+
+  if (pathname === "/relay/codex/token" && request.method === "GET") {
+    // 중계 워크플로가 자기 레포 이름을 알려줘요. 새로고침 때 이 레포의 워크플로를 실행해요.
+    // (레포를 복사해 쓰는 사람마다 레포 이름이 달라서, 코드에 박아두지 않고 이렇게 알아내요.)
+    const repo = request.headers.get("X-GitHub-Repository") || "";
+    if (/^[\w.-]+\/[\w.-]+$/.test(repo) && repo !== (await env.KV.get("github:repo"))) {
+      await env.KV.put("github:repo", repo);
+    }
+    const force = new URL(request.url).searchParams.get("force") === "1";
+    try {
+      const t = force ? await codex.forceRefresh(env) : await codex.getAccessToken(env);
+      return json(t ? { connected: true, ...t } : { connected: false });
+    } catch (err) {
+      await saveRelayError(env, err.message, err instanceof AuthExpiredError);
+      return json({ error: err.message }, 502);
+    }
+  }
+
+  if (pathname === "/relay/codex/usage" && request.method === "POST") {
+    const body = await request.json().catch(() => null);
+    if (!body) return json({ error: "잘못된 요청" }, 400);
+    if (body.ok) {
+      await putJson(env.KV, "usage:codex", { ok: true, via: "relay", fetched_at: now(), ...codex.normalize(body.data) });
+    } else {
+      await saveRelayError(env, String(body.error || "알 수 없는 오류"), body.status === 401);
+    }
+    return json({ ok: true });
+  }
+
+  return json({ error: "not found" }, 404);
+}
+
+async function saveRelayError(env, message, needsReconnect) {
+  const prev = await getJson(env.KV, "usage:codex");
+  await putJson(env.KV, "usage:codex", {
+    ...(prev || {}),
+    ok: false,
+    via: "relay",
+    error: message,
+    needs_reconnect: needsReconnect,
+    error_at: now(),
+  });
+}
+
+// ---- 인증 ----
+
+async function login(request, env) {
+  const body = await request.json().catch(() => ({}));
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  const failKey = `loginfail:${ip}`;
+  const fails = Number(await env.KV.get(failKey)) || 0;
+  if (fails >= 10) return json({ error: "시도가 너무 많아요. 15분 뒤에 다시 해주세요." }, 429);
+
+  if (!(await safeEqual(String(body.password || ""), env.DASHBOARD_PASSWORD))) {
+    await env.KV.put(failKey, String(fails + 1), { expirationTtl: 900 });
+    return json({ error: "비밀번호가 틀렸어요." }, 401);
+  }
+  const token = randomToken(32);
+  await env.KV.put(`session:${token}`, "1", { expirationTtl: SESSION_TTL });
+  return json({ ok: true }, 200, {
+    "Set-Cookie": `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_TTL}`,
+  });
+}
+
+async function logout(request, env) {
+  const token = getCookie(request, SESSION_COOKIE);
+  if (token) await env.KV.delete(`session:${token}`);
+  return json({ ok: true }, 200, {
+    "Set-Cookie": `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`,
+  });
+}
+
+async function isAuthed(request, env) {
+  const token = getCookie(request, SESSION_COOKIE);
+  return !!token && !!(await env.KV.get(`session:${token}`));
+}
+
+function getCookie(request, name) {
+  const header = request.headers.get("Cookie") || "";
+  for (const part of header.split(";")) {
+    const [k, ...v] = part.trim().split("=");
+    if (k === name) return v.join("=");
+  }
+  return null;
+}
+
+async function safeEqual(a, b) {
+  const enc = new TextEncoder();
+  const [ha, hb] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(a)),
+    crypto.subtle.digest("SHA-256", enc.encode(b)),
+  ]);
+  const x = new Uint8Array(ha);
+  const y = new Uint8Array(hb);
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
+}
+
+// ---- 응답 헬퍼 ----
+
+function now() {
+  return Math.floor(Date.now() / 1000);
+}
+
+function json(data, status = 200, headers = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", ...headers },
+  });
+}
+
+function html(body) {
+  return new Response(body, {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+      "X-Frame-Options": "DENY",
+      "Referrer-Policy": "no-referrer",
+    },
+  });
+}
+
+function manifest() {
+  return new Response(MANIFEST, { headers: { "Content-Type": "application/manifest+json" } });
+}
